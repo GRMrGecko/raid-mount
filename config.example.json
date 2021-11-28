@@ -1,0 +1,8 @@
+{
+    "services": [
+        "docker",
+        "nfs-server",
+        "smb",
+        "netatalk"
+    ]
+}

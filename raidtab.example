@@ -1,0 +1,6 @@
+# Source Target FSType Flags CryptName
+/dev/sdb1 /mnt/sdb1 xfs defaults none
+/dev/sdc1 /mnt/sdc1 xfs defaults sdc1
+
+# Merged
+/mnt/sdb1:/mnt/sdc1 /mnt/merged mergerfs config=/etc/mergerfs.ini,allow_other,use_ino,fsname=merged none
