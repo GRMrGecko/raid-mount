@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/term"
@@ -21,6 +22,7 @@ type RaidMount struct {
 	Flags     string
 	CryptName string
 	Encrypted bool
+	Parallel  bool
 }
 
 // App: Global application structure.
@@ -50,6 +52,103 @@ func isMounted(target string) bool {
 		}
 	}
 	return false
+}
+
+func mountDrive(mount RaidMount, encryptionPassword string, wg *sync.WaitGroup) {
+	// Make sure we tell the wait group that we're done when the mount is done.
+	defer wg.Done()
+	// If encrypted, decrypt the drive.
+	if mount.Encrypted {
+		// Check the device path to see if the encrypted drive is already decrypted.
+		dmPath := "/dev/mapper/" + mount.CryptName
+		if _, err := os.Stat(dmPath); err == nil {
+			fmt.Println("Already decrypted:", mount.CryptName)
+			return
+		}
+
+		// Decrypt the drive.
+		args := []string{
+			"open",
+			mount.Source,
+			mount.CryptName,
+		}
+
+		// If encryption key file was provided, add argument.
+		if app.config.EncryptionKey != "" {
+			args = append(args, "--key-file="+app.config.EncryptionKey)
+		}
+
+		fmt.Println("cryptsetup", args)
+		cmd := exec.Command("cryptsetup", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		// If password was provided, send it to cryptsetup.
+		if encryptionPassword != "" {
+			fmt.Fprintln(stdin, encryptionPassword)
+		}
+
+		// Run cryptsetup to decrypt drive and any error is fatal due to it preventing all required drives from mounting.
+		err = cmd.Start()
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		err = cmd.Wait()
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		// If we cannot verify that its decrypted, then we need to stop as mount won't work.
+		if _, err := os.Stat(dmPath); err != nil {
+			log.Fatalln("Unable to decrypt:", mount.CryptName)
+		}
+
+		// Now that its decrypted, update the source path for mounting.
+		mount.Source = dmPath
+	}
+
+	// If we're already mounted on this mountpoint, skip to the next one.
+	if isMounted(mount.Target) {
+		fmt.Println(mount.Target, "is already mounted")
+		return
+	}
+
+	// Mount the mountpoint.
+	args := []string{
+		"-t",
+		mount.FSType,
+		"-o",
+		mount.Flags,
+		mount.Source,
+		mount.Target,
+	}
+
+	fmt.Println("mount", args)
+	cmd := exec.Command("mount", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Run mount to mount the mountpoint, any error is fatal as we want to ensure that mountpoints mount.
+	err := cmd.Start()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	err = cmd.Wait()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// Verified that it actually mounted.
+	if !isMounted(mount.Target) {
+		log.Fatalln("Unable to mount:", mount.Target)
+	}
 }
 
 // main: Starting application function.
@@ -99,7 +198,7 @@ func main() {
 		}
 
 		// If line is not 5 fields, some formatting is wrong in the table. We will just log/ignore this line.
-		if len(args) != 5 {
+		if len(args) != 6 {
 			log.Println("Line does not have correct number of arguments:", line)
 			continue
 		}
@@ -112,12 +211,18 @@ func main() {
 			Flags:     args[3],
 			CryptName: args[4],
 			Encrypted: false,
+			Parallel:  false,
 		}
 
 		// If the CryptName field is not none, then it is an encrypted drive. We must set the variables for logic below to easily determine if it has encryption.
 		if mount.CryptName != "none" {
 			mount.Encrypted = true
 			hasEncryptedDrives = true
+		}
+
+		// Determine if parallel mount.
+		if args[5] == "1" {
+			mount.Parallel = true
 		}
 
 		// If the source drive is a UUID or PARTUUID, expand to device name.
@@ -161,101 +266,19 @@ func main() {
 	}
 
 	// With each mountpoint, decrypt and mount.
+	var wg sync.WaitGroup
 	for _, mount := range raidMounts {
-		// If encrypted, decrypt the drive.
-		if mount.Encrypted {
-			// Check the device path to see if the encrypted drive is already decrypted.
-			dmPath := "/dev/mapper/" + mount.CryptName
-			if _, err := os.Stat(dmPath); err == nil {
-				fmt.Println("Already decrypted:", mount.CryptName)
-				continue
-			}
-
-			// Decrypt the drive.
-			args := []string{
-				"open",
-				mount.Source,
-				mount.CryptName,
-			}
-
-			// If encryption key file was provided, add argument.
-			if app.config.EncryptionKey != "" {
-				args = append(args, "--key-file="+app.config.EncryptionKey)
-			}
-
-			fmt.Println("cryptsetup", args)
-			cmd := exec.Command("cryptsetup", args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-
-			stdin, err := cmd.StdinPipe()
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			// If password was provided, send it to cryptsetup.
-			if encryptionPassword != "" {
-				fmt.Fprintln(stdin, encryptionPassword)
-			}
-
-			// Run cryptsetup to decrypt drive and any error is fatal due to it preventing all required drives from mounting.
-			err = cmd.Start()
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			err = cmd.Wait()
-			if err != nil {
-				log.Fatalln(err)
-			}
-
-			// If we cannot verify that its decrypted, then we need to stop as mount won't work.
-			if _, err := os.Stat(dmPath); err != nil {
-				log.Fatalln("Unable to decrypt:", mount.CryptName)
-			}
-
-			// Now that its decrypted, update the source path for mounting.
-			mount.Source = dmPath
+		// If this task is not parallel, wait for previous tasks to complete before processing.
+		if !mount.Parallel {
+			wg.Wait()
 		}
-
-		// If we're already mounted on this mountpoint, skip to the next one.
-		if isMounted(mount.Target) {
-			fmt.Println(mount.Target, "is already mounted")
-			continue
-		}
-
-		// Mount the mountpoint.
-		args := []string{
-			"-t",
-			mount.FSType,
-			"-o",
-			mount.Flags,
-			mount.Source,
-			mount.Target,
-		}
-
-		fmt.Println("mount", args)
-		cmd := exec.Command("mount", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		// Run mount to mount the mountpoint, any error is fatal as we want to ensure that mountpoints mount.
-		err = cmd.Start()
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		err = cmd.Wait()
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		// Verified that it actually mounted.
-		if !isMounted(mount.Target) {
-			log.Fatalln("Unable to mount:", mount.Target)
-			continue
-		}
+		// Add 1 to the wait group as we're spawning a task.
+		wg.Add(1)
+		// Mount the drive.
+		go mountDrive(mount, encryptionPassword, &wg)
 	}
+	// Now that all mounts are in progress, we wait before starting services.
+	wg.Wait()
 
 	// Now that all mountpoints are mounted, start the services in configuration.
 	for _, service := range app.config.Services {
